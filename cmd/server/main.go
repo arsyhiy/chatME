@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"database/sql"
 	"fmt"
 	"log"
 	"net"
@@ -9,45 +10,63 @@ import (
 	"time"
 
 	"github.com/arsyhiy/sshme/internal/chat"
+	"github.com/arsyhiy/sshme/internal/database"
+	_ "github.com/mattn/go-sqlite3"
 )
 
-func handleConnection(conn net.Conn, c *chat.Chat) {
+func handleConnection(conn net.Conn, c *chat.Chat, storage *database.Storage) {
 	defer conn.Close()
-	reader := bufio.NewReader(conn)
 
-	// Отправка приглашения имени с переводом строки
 	fmt.Fprintln(conn, "Введите имя:")
 
-	name, err := reader.ReadString('\n')
-	if err != nil {
-		return
-	}
+	reader := bufio.NewReader(conn)
+	name, _ := reader.ReadString('\n')
 	name = strings.TrimSpace(name)
 
-	// Создание пользователя
+	// Проверяем есть ли пользователь в базе
+	var id int64
+	err := storage.DB.QueryRow("SELECT id FROM users WHERE name = ?", name).Scan(&id)
+	if err == sql.ErrNoRows {
+		res, _ := storage.DB.Exec("INSERT INTO users(name) VALUES(?)", name)
+		id, _ = res.LastInsertId()
+	}
+
 	colors := []string{"\033[91m", "\033[92m", "\033[93m", "\033[94m", "\033[95m", "\033[96m"}
 	user := &chat.User{
+		ID:    id,
 		Name:  name,
 		Color: colors[len(c.Users)%len(colors)],
 		Out:   make(chan string, 10),
 	}
 	c.AddUser(user)
 
-	// Отправляем приветствие
 	fmt.Fprintf(conn, "Привет, %s! Введите сообщение:\n", user.Name)
 
-	// Отправка сообщений пользователю через TCP
+	// Загружаем последние 20 сообщений из базы
+	rows, err := storage.DB.Query("SELECT username, text FROM messages ORDER BY id DESC LIMIT 20")
+	if err == nil {
+		defer rows.Close()
+		var history []string
+		for rows.Next() {
+			var uname, text string
+			rows.Scan(&uname, &text)
+			history = append([]string{fmt.Sprintf("[%s]: %s", uname, text)}, history...)
+		}
+		for _, msg := range history {
+			fmt.Fprintln(conn, msg)
+		}
+	}
+
 	go func() {
 		for msg := range user.Out {
-			fmt.Fprintln(conn, msg) // обязательно с переводом строки
+			fmt.Fprintln(conn, msg)
 		}
 	}()
 
-	// Чтение сообщений от клиента
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
-			fmt.Println(name, "отключился")
+			fmt.Println(name, "disconnected")
 			c.RemoveUser(user.Name)
 			return
 		}
@@ -73,6 +92,8 @@ func handleConnection(conn net.Conn, c *chat.Chat) {
 			}
 			c.Broadcast(msg)
 		} else {
+			// Сохраняем общее сообщение через Storage
+			_ = storage.AddMessage(user.Name, "", line)
 			msg := chat.Message{
 				Text:       fmt.Sprintf("%s[%s] %s: %s\033[0m", user.Color, now, user.Name, line),
 				Recipients: nil,
@@ -83,6 +104,30 @@ func handleConnection(conn net.Conn, c *chat.Chat) {
 }
 
 func main() {
+	storage, err := database.NewStorage("chat.db")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer storage.Close()
+
+	ch := chat.NewChat() // создаём объект чата
+
+	// Загружаем историю из базы
+	rows, err := storage.DB.Query("SELECT sender, text FROM messages ORDER BY id ASC")
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var uname, text string
+			rows.Scan(&uname, &text)
+			msg := chat.Message{
+				Text:       fmt.Sprintf("[%s]: %s", uname, text),
+				Recipients: nil,
+			}
+			ch.History = append(ch.History, msg)
+		}
+	}
+
+	// запускаем сервер
 	listener, err := net.Listen("tcp", ":2222")
 	if err != nil {
 		log.Fatal(err)
@@ -90,7 +135,6 @@ func main() {
 	defer listener.Close()
 
 	fmt.Println("Сервер слушает :2222 ...")
-	chat := chat.NewChat()
 
 	for {
 		conn, err := listener.Accept()
@@ -98,7 +142,6 @@ func main() {
 			log.Println("Ошибка подключения:", err)
 			continue
 		}
-		go handleConnection(conn, chat)
+		go handleConnection(conn, ch, storage)
 	}
 }
-

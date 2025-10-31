@@ -9,7 +9,7 @@ import (
 
 func main() {
 	if len(os.Args) < 3 {
-		fmt.Println("Использование: client <host> <порт>")
+		fmt.Println("usage: client <host> <port>") // мне не нравится то что при Println создается новая линия над тем что мы пишешь
 		return
 	}
 	host := os.Args[1]
@@ -56,4 +56,3 @@ func main() {
 		conn.Write([]byte(text + "\n"))
 	}
 }
-
